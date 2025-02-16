@@ -1,0 +1,138 @@
+import logging
+import requests
+import queue
+import threading
+import time
+from io import BytesIO
+from PIL import Image
+from googletrans import Translator
+from telegram import Update, Bot
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
+# ------ تنظیمات ربات ------
+TOKEN = "7864181902:AAHn-FMM-BPQ-O8MqB5Fs5XP4Rnv-xZ3aFo"
+HF_API_KEY = "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"
+MODEL = "stabilityai/stable-diffusion-3.5-large-turbo"
+
+# ------ تنظیمات لاگ ------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# ------ مترجم گوگل ------
+translator = Translator()
+
+# ------ صف درخواست‌ها ------
+image_queue = queue.Queue()
+
+# ------ تابع تولید تصویر با Stable Diffusion ------
+def generate_image(prompt):
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {"inputs": prompt}
+    response = requests.post(
+        f"https://api-inference.huggingface.co/models/{MODEL}",
+        headers=headers,
+        json=payload
+    )
+    if response.status_code == 200:
+        return Image.open(BytesIO(response.content))
+    else:
+        logging.error(f"Error generating image: {response.text}")
+        return None
+
+# ------ کارگر پردازش درخواست‌های تولید تصویر ------
+def image_worker(bot: Bot):
+    while True:
+        task = image_queue.get()
+        update = task["update"]
+        prompt = task["prompt"]
+        chat_id = update.effective_chat.id
+        waiting_message_id = task["waiting_message_id"]
+
+        # تولید تصویر
+        image = generate_image(prompt)
+        
+        # حذف پیام "⌛"
+        bot.delete_message(chat_id, waiting_message_id)
+
+        if image:
+            bio = BytesIO()
+            image.save(bio, format="PNG")
+            bio.seek(0)
+            bot.send_photo(chat_id, photo=bio, caption="بفرمایید 😊")
+        else:
+            bot.send_message(chat_id, text="❌")
+
+        # فاصله زمانی برای جلوگیری از محدودیت‌های API
+        time.sleep(20)
+        image_queue.task_done()
+
+# ------ هندلر پیام‌های متنی ------
+def handle_text(update: Update, context: CallbackContext):
+    chat_type = update.effective_chat.type
+    user_text = update.message.text.strip()
+
+    # اگر پیام در گروه یا سوپرگروه بود:
+    if chat_type in ["group", "supergroup"]:
+        if not user_text.startswith("/asp"):
+            return  # پیام عادی نادیده گرفته می‌شود
+        prompt = user_text[4:].strip()  # حذف "/asp"
+        if not prompt:
+            update.message.reply_text("لطفاً متن مورد نظر را پس از /asp وارد کنید.")
+            return
+
+    # اگر پیام در پی‌وی (private) بود:
+    elif chat_type == "private":
+        prompt = user_text
+    else:
+        return  # انواع دیگر را نادیده بگیریم
+
+    # ترجمه به انگلیسی
+    translated_text = translator.translate(prompt, dest="en").text
+    logging.info(f"Prompt: {prompt} -> Translated: {translated_text}")
+
+    # ارسال پیام انتظار و ذخیره `message_id`
+    waiting_message = update.message.reply_text("⌛")
+    waiting_message_id = waiting_message.message_id
+
+    # افزودن درخواست به صف
+    image_queue.put({
+        "update": update,
+        "prompt": translated_text,
+        "waiting_message_id": waiting_message_id
+    })
+
+# ------ دستور /start برای خوش‌آمدگویی ------
+def start(update: Update, context: CallbackContext):
+    welcome_text = (
+        "🎨 خوش آمدید!\n\n"
+        "• در گروه: برای تولید تصویر از دستور زیر استفاده کنید:\n"
+        "/asp متن شما\n"
+        "مثال: /asp سلام دنیا\n\n"
+        "• در پی‌وی: هر متنی ارسال کنید، تصویر آن تولید می‌شود."
+    )
+    update.message.reply_text(welcome_text)
+
+# ------ تابع اصلی راه‌اندازی ربات ------
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.text, handle_text))
+
+    # راه‌اندازی ترد کارگر صف
+    worker_thread = threading.Thread(
+        target=image_worker,
+        args=(updater.bot,),
+        daemon=True
+    )
+    worker_thread.start()
+
+    logging.info("🤖 ربات در حال اجراست...")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
